@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/28916169/README.md)
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started
