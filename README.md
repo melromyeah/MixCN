@@ -1,8 +1,5 @@
 # 🎧 MixCN
 
-# Preview
-(https://mix-cn-kappa.vercel.app)
-
 A fully client-side **DJ console that runs entirely in your browser** — dual decks, a real mixer, vinyl-accurate scratching, a sophisticated beat-grid analyzer, bar-fraction looping, and one-click mix recording. No backend, no uploads: every track you drop in is decoded and processed locally with the Web Audio API and never leaves your machine.
 
 Built with **Next.js + React + TypeScript + Tailwind**, styled with the default **shadcn/ui** theme, and rounded out with a set of hand-built audio-UI components (knobs, faders, jog wheels, VU meters) drawn to match that aesthetic where shadcn has no equivalent.
@@ -14,30 +11,35 @@ Built with **Next.js + React + TypeScript + Tailwind**, styled with the default 
 ### Decks
 - **Two independent decks (A / B)** with their own transport, pitch, EQ, loops and hot cues.
 - **Vinyl-style jog wheel** powered by a custom `AudioWorklet`: grabbing the platter takes over playback completely — drag forward/back to **scratch** (the audio plays in reverse on backward motion), hold the record still for silence, and release to ramp smoothly back up to speed. Works whether the deck is playing or paused.
-- **Canvas waveform overview** with played/unplayed coloring, the live playhead, the loop region, the cue point, and hot-cue markers. Click or drag anywhere on it to seek.
+- **Dual waveforms** — a full-track overview (click/drag to seek) plus a **zoomed strip that scrolls under a fixed playhead**, with beat-grid tick marks and emphasized downbeats, the loop region, and hot-cue markers.
 - **CDJ-style transport** — play/pause plus a proper **CUE** button (set cue point when paused, jump-back-and-pause when playing).
-- **Pitch fader (±8%)** with a soft center detent that snaps cleanly to 0%.
+- **Slip mode** — arm **SLIP** and a ghost playhead keeps running through scratches and loops; release and playback snaps to where the track would have been (loop rolls, slip scratching).
+- **Pitch fader** with a soft center detent that snaps cleanly to 0%.
 
 ### Sophisticated beat detection & sync
 - On load, each track is run through a **multi-stage beat-grid analyzer** (`lib/dj/beatgrid.ts`):
   - loudest-window selection → mono downmix
-  - multi-band (low/mid/high) onset-envelope extraction
-  - **harmonic-scored autocorrelation** with a tempo prior to avoid half/double-tempo errors
-  - **comb-filter fine search** that refines BPM to ~0.01 resolution and locks the beat phase
-  - **downbeat detection** from low-band energy to find where each bar starts
+  - **STFT spectral-flux onset detection** over log-spaced frequency bands (mel-style), so kicks aren't out-voted by broadband hi-hats
+  - **harmonic-scored autocorrelation** proposes multiple tempo candidates — including half/double and shuffle relatives — weighted by a gentle tempo prior
+  - every candidate is verified by **dynamic-programming beat tracking**, and the winning beat sequence is **least-squares regressed** into a precise grid (sub-0.1-BPM, ~1ms beat phase)
+  - **downbeat detection** scores the four beat rotations against low-band energy — bars start where the bass lands
 - The result is a full **beat grid** (precise BPM + beat phase + downbeat), not just a BPM guess.
 - **SYNC** matches the other deck's exact tempo *and* **phase-aligns the bars**: both decks are sampled against a shared audio-thread clock (worklet frame stamps) and nudged onto the same position within the bar — accurate to a couple of milliseconds.
 
-### Looping
-- **Bar-fraction loops** — ⅛, ¼, ½, 1, 2 and 4 bars.
-- With a beat grid present, loops **snap onto the grid line** of their own subdivision, so they always land musically in place. Toggle a size again or hit **Exit** to drop the loop.
+### Looping & navigation
+- **Bar-fraction loops** — 1/32, 1/16, 1/8, 1/4, 1/2 and 1 bar.
+- With a beat grid present, loops **snap onto the grid line** of their own subdivision, so they always land musically in place. Toggle a size again to drop the loop.
+- **Beat jump** — hop ±1, 2 or 4 bars in one click. Jumps are whole-bar multiples, so a synced deck stays perfectly in phase.
+- **Beat-phase indicator** — four dots between the time readouts light up beat-by-beat through the bar.
 
 ### Mixer
 - Per-channel **trim**, **3-band EQ** (low / mid / high) with full **kill**, and a sweepable **LP/HP filter** knob.
+- **Beat-synced FX per channel** — echo (delay time locked to the effective tempo in beat divisions), a generated-impulse reverb, and an LFO flanger, each with a wet-amount knob.
 - **Channel volume faders** with live **VU meters**.
-- **Equal-power crossfader** with a center snap.
+- **Plateau-curve crossfader** with a center snap — each deck plays at full volume across its own half and only fades out past the middle, hitting silence at the opposite end.
 - **Vertical master fader sitting between the two channels**, flanked by a true **stereo (L/R) master VU**.
-- **4 hot cues per deck** — click to set/jump, right-click to clear.
+- **Master safety limiter** — a hard-knee brickwall stage on the master bus, so slamming both channels never clips the output (the meters and recording are post-limiter).
+- **4 hot cues per deck** — click to set/jump, right-click to clear. New cues are **quantized to the nearest beat** when a grid is available.
 
 ### The extras
 - **Bass-reactive console glow** — an *inaudible* branch low-passes the master to mono and dead-ends it (it never reaches your speakers); its energy drives a single CSS variable that makes every panel's outline pulse with the low end.
@@ -45,10 +47,11 @@ Built with **Next.js + React + TypeScript + Tailwind**, styled with the default 
 - **Mirror-symmetric, full-viewport layout** that adapts to any screen size, in the default shadcn dark theme.
 
 ### Track library
-- **Drag-and-drop** audio files anywhere onto the library card, or use **Add files**.
-- Supports **MP3, WAV, OGG, M4A, FLAC, AAC**.
-- Everything is decoded and analyzed **locally** — nothing is uploaded.
-- Parses `Artist - Title` filenames, shows detected BPM and length, and loads any track to deck **A** or **B** with one click.
+- **Drag-and-drop** audio files anywhere onto the library card, or use **Add files**. Supports **MP3, WAV, OGG, M4A, FLAC, AAC**.
+- **Persistent** — tracks and their full analysis (beat grid, key, loudness, waveform) are stored in IndexedDB and survive reloads; audio is re-decoded on demand. Nothing is ever uploaded.
+- **Musical key detection** — a chromagram matched against Krumhansl key profiles yields the key and its **Camelot wheel** position; tracks **harmonically compatible** with a loaded deck are highlighted.
+- **Auto-gain** — per-track loudness is measured at analysis time and normalized at a dedicated gain stage, so every track loads at a consistent level.
+- **Search and sortable columns** (title, artist, key, BPM, length), parsed `Artist - Title` filenames, one-click load to deck **A** or **B**, per-row delete.
 
 ---
 

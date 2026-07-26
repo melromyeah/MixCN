@@ -1,6 +1,6 @@
 {
-  "name": "app",
-  "version": "0.1.0",
+  "name": "MixCN",
+  "version": "0.1.23",
   "private": true,
   "scripts": {
     "dev": "next dev",
