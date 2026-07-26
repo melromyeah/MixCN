@@ -6,6 +6,8 @@ interface WorkletMessage {
   f?: number
 }
 
+export type FxType = "off" | "echo" | "reverb" | "flanger"
+
 /**
  * One playback deck: vinyl worklet -> trim -> 3-band EQ -> filter ->
  * channel fader -> crossfader gain -> master.
@@ -19,6 +21,7 @@ export class DeckEngine {
   readonly ctx: AudioContext
   readonly analyser: AnalyserNode
 
+  private readonly autoGain: GainNode
   private readonly trim: GainNode
   private readonly eqLow: BiquadFilterNode
   private readonly eqMid: BiquadFilterNode
@@ -26,6 +29,25 @@ export class DeckEngine {
   private readonly filter: BiquadFilterNode
   private readonly fader: GainNode
   private readonly xfade: GainNode
+
+  // FX sends (post-filter, pre-fader). All three chains stay wired; only
+  // the active one gets send/wet gain.
+  private readonly echoSend: GainNode
+  private readonly echoDelay: DelayNode
+  private readonly echoFeedback: GainNode
+  private readonly echoWet: GainNode
+  private readonly reverbSend: GainNode
+  private readonly reverb: ConvolverNode
+  private readonly reverbWet: GainNode
+  private readonly flangerSend: GainNode
+  private readonly flangerDelay: DelayNode
+  private readonly flangerFeedback: GainNode
+  private readonly flangerWet: GainNode
+
+  private _fxType: FxType = "off"
+  private _fxWet = 0.5
+  private _fxBeats = 0.5
+  private _slipMode = false
 
   private node: AudioWorkletNode | null = null
   private pendingMessages: { msg: unknown; transfer?: Transferable[] }[] = []
@@ -52,6 +74,7 @@ export class DeckEngine {
 
   constructor(ctx: AudioContext, destination: AudioNode, workletReady: Promise<unknown>) {
     this.ctx = ctx
+    this.autoGain = ctx.createGain()
     this.trim = ctx.createGain()
 
     this.eqLow = ctx.createBiquadFilter()
@@ -75,6 +98,7 @@ export class DeckEngine {
     this.analyser.fftSize = 1024
     this.xfade = ctx.createGain()
 
+    this.autoGain.connect(this.trim)
     this.trim.connect(this.eqLow)
     this.eqLow.connect(this.eqMid)
     this.eqMid.connect(this.eqHigh)
@@ -84,6 +108,60 @@ export class DeckEngine {
     this.analyser.connect(this.xfade)
     this.xfade.connect(destination)
 
+    // ----- FX chains (send-style, tapping the post-filter signal) -----
+    // Echo: send -> delay -> wet, with a tone-shaped feedback loop.
+    this.echoSend = ctx.createGain()
+    this.echoSend.gain.value = 0
+    this.echoDelay = ctx.createDelay(2)
+    this.echoFeedback = ctx.createGain()
+    this.echoFeedback.gain.value = 0
+    const echoTone = ctx.createBiquadFilter()
+    echoTone.type = "lowpass"
+    echoTone.frequency.value = 4000
+    this.echoWet = ctx.createGain()
+    this.echoWet.gain.value = 0
+    this.filter.connect(this.echoSend)
+    this.echoSend.connect(this.echoDelay)
+    this.echoDelay.connect(this.echoWet)
+    this.echoDelay.connect(echoTone)
+    echoTone.connect(this.echoFeedback)
+    this.echoFeedback.connect(this.echoDelay)
+    this.echoWet.connect(this.fader)
+
+    // Reverb: send -> convolver (impulse generated lazily) -> wet.
+    this.reverbSend = ctx.createGain()
+    this.reverbSend.gain.value = 0
+    this.reverb = ctx.createConvolver()
+    this.reverbWet = ctx.createGain()
+    this.reverbWet.gain.value = 0
+    this.filter.connect(this.reverbSend)
+    this.reverbSend.connect(this.reverb)
+    this.reverb.connect(this.reverbWet)
+    this.reverbWet.connect(this.fader)
+
+    // Flanger: short modulated delay with feedback.
+    this.flangerSend = ctx.createGain()
+    this.flangerSend.gain.value = 0
+    this.flangerDelay = ctx.createDelay(0.05)
+    this.flangerDelay.delayTime.value = 0.0025
+    this.flangerFeedback = ctx.createGain()
+    this.flangerFeedback.gain.value = 0
+    this.flangerWet = ctx.createGain()
+    this.flangerWet.gain.value = 0
+    const lfo = ctx.createOscillator()
+    lfo.frequency.value = 0.25
+    const lfoDepth = ctx.createGain()
+    lfoDepth.gain.value = 0.0018
+    lfo.connect(lfoDepth)
+    lfoDepth.connect(this.flangerDelay.delayTime)
+    lfo.start()
+    this.filter.connect(this.flangerSend)
+    this.flangerSend.connect(this.flangerDelay)
+    this.flangerDelay.connect(this.flangerWet)
+    this.flangerDelay.connect(this.flangerFeedback)
+    this.flangerFeedback.connect(this.flangerDelay)
+    this.flangerWet.connect(this.fader)
+
     workletReady
       .then(() => {
         const node = new AudioWorkletNode(ctx, "vinyl-player", {
@@ -92,7 +170,7 @@ export class DeckEngine {
           outputChannelCount: [2],
         })
         node.port.onmessage = (e: MessageEvent<WorkletMessage>) => this.onWorkletMessage(e.data)
-        node.connect(this.trim)
+        node.connect(this.autoGain)
         this.node = node
         for (const p of this.pendingMessages) {
           node.port.postMessage(p.msg, p.transfer ?? [])
@@ -185,6 +263,9 @@ export class DeckEngine {
       channels.push(data.buffer)
     }
     this.post({ t: "load", channels, length: buf.length, rate: buf.sampleRate }, channels)
+    // Loudness normalization measured at analysis time.
+    this.autoGain.gain.setTargetAtTime(track.gain || 1, this.ctx.currentTime, 0.01)
+    this.updateFxTiming()
     this.emit()
   }
 
@@ -241,12 +322,34 @@ export class DeckEngine {
     this.emit()
   }
 
+  /**
+   * Jump by a signed number of bars. Jumping in whole-bar multiples
+   * keeps the beat phase intact, so a synced deck stays synced.
+   */
+  beatJump(bars: number) {
+    if (!this.track) return
+    const grid = this.track.grid
+    const bpm = grid?.bpm ?? this.track.bpm ?? 120
+    const barLen = (60 / bpm) * (grid?.beatsPerBar ?? 4)
+    this.seek(this.position + bars * barLen)
+  }
+
+  /** Snap a time to the nearest beat when a grid is available. */
+  private quantizeToBeat(time: number): number {
+    const grid = this.track?.grid
+    if (!grid) return time
+    const beatLen = 60 / grid.bpm
+    const snapped = grid.firstBeat + Math.round((time - grid.firstBeat) / beatLen) * beatLen
+    return Math.min(Math.max(snapped, 0), this.duration)
+  }
+
   // ----- pitch -----
 
   /** rate = 1 is original tempo. */
   setRate(rate: number) {
     this._rate = rate
     this.post({ t: "rate", rate })
+    this.updateFxTiming()
     this.emit()
   }
 
@@ -314,14 +417,90 @@ export class DeckEngine {
     this.post({ t: "scratchOff" })
   }
 
+  // ----- slip mode -----
+
+  get slipMode() {
+    return this._slipMode
+  }
+
+  /**
+   * With slip armed, a ghost playhead keeps running at play speed during
+   * scratches and loops; releasing them snaps playback back to where the
+   * track would have been (loop roll / slip scratch).
+   */
+  setSlip(on: boolean) {
+    this._slipMode = on
+    this.post({ t: "slip", on })
+    this.emit()
+  }
+
+  // ----- FX -----
+
+  get fxType() {
+    return this._fxType
+  }
+
+  get fxWet() {
+    return this._fxWet
+  }
+
+  get fxBeats() {
+    return this._fxBeats
+  }
+
+  setFx(type: FxType) {
+    this._fxType = type
+    const t = this.ctx.currentTime
+    if (type === "reverb" && !this.reverb.buffer) {
+      this.reverb.buffer = makeReverbImpulse(this.ctx)
+    }
+    // Sends open only for the active effect; tails ring out via wet gains.
+    this.echoSend.gain.setTargetAtTime(type === "echo" ? 1 : 0, t, 0.02)
+    this.echoFeedback.gain.setTargetAtTime(type === "echo" ? 0.55 : 0, t, 0.02)
+    this.reverbSend.gain.setTargetAtTime(type === "reverb" ? 1 : 0, t, 0.02)
+    this.flangerSend.gain.setTargetAtTime(type === "flanger" ? 1 : 0, t, 0.02)
+    this.flangerFeedback.gain.setTargetAtTime(type === "flanger" ? 0.45 : 0, t, 0.02)
+    this.applyFxWet()
+    this.updateFxTiming()
+    this.emit()
+  }
+
+  setFxWet(wet: number) {
+    this._fxWet = wet
+    this.applyFxWet()
+    this.emit()
+  }
+
+  /** Echo delay length in beats (synced to the effective tempo). */
+  setFxBeats(beats: number) {
+    this._fxBeats = beats
+    this.updateFxTiming()
+    this.emit()
+  }
+
+  private applyFxWet() {
+    const t = this.ctx.currentTime
+    this.echoWet.gain.setTargetAtTime(this._fxType === "echo" ? this._fxWet : 0, t, 0.05)
+    this.reverbWet.gain.setTargetAtTime(this._fxType === "reverb" ? this._fxWet * 1.2 : 0, t, 0.05)
+    this.flangerWet.gain.setTargetAtTime(this._fxType === "flanger" ? this._fxWet : 0, t, 0.05)
+  }
+
+  /** Keep the echo delay locked to the current effective tempo. */
+  private updateFxTiming() {
+    const bpm = this.effectiveBpm ?? 120
+    const seconds = Math.min(this._fxBeats * (60 / bpm), 2)
+    this.echoDelay.delayTime.setTargetAtTime(seconds, this.ctx.currentTime, 0.05)
+  }
+
   // ----- hot cues -----
 
   triggerHotCue(index: number) {
     if (!this.track) return
     const existing = this.hotCues[index]
     if (existing === null) {
+      // Quantized: new cues snap to the nearest beat of the grid.
       this.hotCues = [...this.hotCues]
-      this.hotCues[index] = this.position
+      this.hotCues[index] = this.quantizeToBeat(this.position)
     } else {
       this.seek(existing)
     }
@@ -414,4 +593,18 @@ export class DeckEngine {
 
 function positiveMod(v: number, m: number): number {
   return ((v % m) + m) % m
+}
+
+/** Exponentially decaying stereo noise burst — a serviceable room. */
+function makeReverbImpulse(ctx: AudioContext): AudioBuffer {
+  const seconds = 2.2
+  const length = Math.floor(ctx.sampleRate * seconds)
+  const impulse = ctx.createBuffer(2, length, ctx.sampleRate)
+  for (let ch = 0; ch < 2; ch++) {
+    const data = impulse.getChannelData(ch)
+    for (let i = 0; i < length; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, 2.8)
+    }
+  }
+  return impulse
 }

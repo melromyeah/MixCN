@@ -30,9 +30,23 @@ class VinylPlayer extends AudioWorkletProcessor {
     this.scratchRate = 0;     // signed rate from the platter
     this.rate = 0;            // smoothed actual rate
     this.loop = null;         // { s, e } in buffer frames
+    this.slipMode = false;
+    this.ghost = 0;           // slip ghost playhead (buffer frames)
     this.endedSent = false;
     this.postCounter = 0;
     this.port.onmessage = (e) => this.onMessage(e.data);
+  }
+
+  // While slip is armed, the ghost keeps running at play speed through
+  // scratches and loops; releasing the disturbance snaps back to it.
+  slipEngaged() {
+    return this.slipMode && this.playing && (this.scratching || this.loop);
+  }
+
+  slipRelease() {
+    if (this.slipMode && this.playing) {
+      this.pos = Math.max(0, Math.min(this.ghost, this.length - 1));
+    }
   }
 
   onMessage(d) {
@@ -71,14 +85,24 @@ class VinylPlayer extends AudioWorkletProcessor {
       case "scratchRate":
         this.scratchRate = d.rate;
         break;
-      case "scratchOff":
+      case "scratchOff": {
+        const wasEngaged = this.slipEngaged();
         this.scratching = false;
+        if (wasEngaged && !this.slipEngaged()) this.slipRelease();
         this.endedSent = false;
         break;
-      case "loop":
+      }
+      case "loop": {
+        const wasEngaged = this.slipEngaged();
         this.loop = d.loop
           ? { s: d.loop.start * this.bufferRate, e: d.loop.end * this.bufferRate }
           : null;
+        if (wasEngaged && !this.slipEngaged()) this.slipRelease();
+        break;
+      }
+      case "slip":
+        this.slipMode = d.on;
+        if (!d.on) this.ghost = this.pos;
         break;
       case "shift":
         // Atomic playhead nudge (seconds) for beat/bar phase alignment.
@@ -106,6 +130,16 @@ class VinylPlayer extends AudioWorkletProcessor {
     const k = this.scratching ? 0.55 : 0.18;
     this.rate += (target - this.rate) * k;
     if (target === 0 && Math.abs(this.rate) < 0.0005) this.rate = 0;
+
+    const quantum = outputs[0][0].length;
+    // The slip ghost runs at undisturbed play speed; otherwise it shadows
+    // the real playhead so engaging slip is always seamless.
+    if (this.slipEngaged()) {
+      this.ghost += (this.pitchRate * this.bufferRate * quantum) / sampleRate;
+      if (this.ghost > this.length - 1) this.ghost = this.length - 1;
+    } else {
+      this.ghost = this.pos;
+    }
 
     if (this.rate === 0) {
       // Held still / stopped: silence (outputs are pre-zeroed).

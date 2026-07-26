@@ -40,6 +40,8 @@ export async function createDemoTracks(): Promise<Track[]> {
       bpm: spec.bpm,
       // Synthesized on a fixed grid: beat zero lands exactly at t=0.
       grid: { bpm: spec.bpm, firstBeat: 0, firstBar: 0, beatsPerBar: 4 },
+      key: null,
+      gain: 1,
       buffer,
       peaks: computePeaks(buffer),
     })

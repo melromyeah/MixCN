@@ -1,20 +1,29 @@
+import { makeFft, positiveMod } from "./dsp"
 import type { BeatGrid } from "./types"
 
 /**
- * Beat grid analyzer.
+ * Beat-grid analyzer.
  *
- * Pipeline (all in plain JS over the decoded PCM, no audio graph needed):
- *  1. Pick the loudest ~90s window of the track and downmix it to mono.
- *  2. Split into low/mid/high bands with one-pole filters and build
- *     per-band onset envelopes (rectified differences of compressed RMS,
- *     ~86 frames/s), weighting the low band — kicks carry the groove.
- *  3. Estimate the tempo with an autocorrelation of the onset envelope,
- *     scored together with its 2x/3x harmonics, refined by parabolic
- *     interpolation.
- *  4. Fine-tune BPM and beat phase jointly with a comb-filter grid search
- *     (±2% around the ACF estimate, ~0.01 BPM resolution at the end).
- *  5. Pick the downbeat among the four beat candidates by scoring the
- *     low-band onsets on each — bars start where the bass lands.
+ * Pipeline (all plain JS over the decoded PCM):
+ *  1. Take the loudest ~90s of the track, downmix to mono, decimate 2x.
+ *  2. STFT spectral flux: Hann-windowed FFT frames, half-wave-rectified
+ *     log-magnitude differences summed over the spectrum. This is far more
+ *     robust on dense real-world mixes than band-energy envelopes. The
+ *     low-frequency portion of the flux is kept separately for downbeats.
+ *  3. Adaptive post-processing: local-mean removal + normalization, so
+ *     slow dynamics (swells, fades) don't pollute the periodicity search.
+ *  4. Harmonic-scored autocorrelation proposes SEVERAL tempo candidates —
+ *     including half/double and 2:3 shuffle relatives — instead of
+ *     trusting a single peak. A gentle log-Gaussian prior nudges ties
+ *     toward the typical DJ range without overriding real evidence.
+ *  5. Every candidate is verified by dynamic-programming beat tracking
+ *     (Ellis-style): the tracker tolerates local timing wobble, and the
+ *     candidate whose tracked beats actually land on onsets wins.
+ *  6. The winning beat sequence is least-squares regressed (with outlier
+ *     rejection) into a constant grid — averaging ~hundreds of beats
+ *     pins the BPM far more precisely than any single measurement.
+ *  7. Downbeat detection: the four beat rotations are scored against the
+ *     low-band flux — bars start where the bass lands.
  */
 export async function analyzeBeatGrid(buffer: AudioBuffer): Promise<BeatGrid | null> {
   try {
@@ -26,184 +35,326 @@ export async function analyzeBeatGrid(buffer: AudioBuffer): Promise<BeatGrid | n
   }
 }
 
-const HOP = 512
-const MIN_BPM = 60
-const MAX_BPM = 180
+const WIN = 1024
+const HOP = 256
+const MIN_BPM = 55
+const MAX_BPM = 200
 const BEATS_PER_BAR = 4
+const ANALYSIS_SECONDS = 90
 
 function analyze(buffer: AudioBuffer): BeatGrid | null {
-  const sr = buffer.sampleRate
   if (buffer.duration < 8) return null
 
-  // ---- 1. loudest window, downmixed to mono ----
-  const windowLength = Math.min(buffer.length, Math.floor(sr * 90))
-  const start = loudestWindowStart(buffer, windowLength)
-  const mono = new Float32Array(windowLength)
+  // ---- 1. loudest window, mono, decimated ----
+  const decim = buffer.sampleRate >= 32000 ? 2 : 1
+  const srA = buffer.sampleRate / decim
+  const winSamples = Math.min(buffer.length, Math.floor(buffer.sampleRate * ANALYSIS_SECONDS))
+  const start = loudestWindowStart(buffer, winSamples)
+  const monoLen = Math.floor(winSamples / decim)
+  const mono = new Float32Array(monoLen)
   {
-    const tmp = new Float32Array(windowLength)
+    const tmp = new Float32Array(winSamples)
     for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
       buffer.copyFromChannel(tmp, ch, start)
-      for (let i = 0; i < windowLength; i++) mono[i] += tmp[i] / buffer.numberOfChannels
-    }
-  }
-
-  // ---- 2. band onset envelopes ----
-  const frames = Math.floor(windowLength / HOP)
-  if (frames < 256) return null
-  const envRate = sr / HOP
-  const onset = new Float32Array(frames) // combined
-  const lowOnset = new Float32Array(frames) // for downbeat scoring
-  {
-    const aLow = onePole(150, sr)
-    const aMid = onePole(2000, sr)
-    let yLow = 0
-    let yMid = 0
-    let prevL = 0
-    let prevM = 0
-    let prevH = 0
-    for (let f = 0; f < frames; f++) {
-      let sumL = 0
-      let sumM = 0
-      let sumH = 0
-      const base = f * HOP
-      for (let i = 0; i < HOP; i++) {
-        const x = mono[base + i]
-        yLow += (1 - aLow) * (x - yLow)
-        yMid += (1 - aMid) * (x - yMid)
-        const lo = yLow
-        const mi = yMid - yLow
-        const hi = x - yMid
-        sumL += lo * lo
-        sumM += mi * mi
-        sumH += hi * hi
+      if (decim === 2) {
+        for (let i = 0; i < monoLen; i++) {
+          mono[i] += (tmp[2 * i] + tmp[2 * i + 1]) / (2 * buffer.numberOfChannels)
+        }
+      } else {
+        for (let i = 0; i < monoLen; i++) mono[i] += tmp[i] / buffer.numberOfChannels
       }
-      // Compressed RMS so quiet passages still contribute onsets.
-      const vL = Math.log1p(25 * Math.sqrt(sumL / HOP))
-      const vM = Math.log1p(25 * Math.sqrt(sumM / HOP))
-      const vH = Math.log1p(25 * Math.sqrt(sumH / HOP))
-      const oL = Math.max(0, vL - prevL)
-      const oM = Math.max(0, vM - prevM)
-      const oH = Math.max(0, vH - prevH)
-      prevL = vL
-      prevM = vM
-      prevH = vH
-      onset[f] = 2 * oL + oM + 0.6 * oH
-      lowOnset[f] = oL
     }
   }
 
-  // ---- 3. tempo via harmonic-scored autocorrelation ----
+  // ---- 2. STFT spectral flux over log-spaced bands ----
+  // Grouping bins into log-frequency bands before the flux (mel-style)
+  // keeps a broadband hi-hat from out-voting the kick just because it
+  // spans hundreds of FFT bins — each band gets one vote.
+  const frames = Math.floor((monoLen - WIN) / HOP)
+  if (frames < 512) return null
+  const envRate = srA / HOP
+  const flux = new Float32Array(frames)
+  const lowFlux = new Float32Array(frames)
+  const lowEnergy = new Float32Array(frames)
+  {
+    const fft = makeFft(WIN)
+    const hann = new Float32Array(WIN)
+    for (let i = 0; i < WIN; i++) hann[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / WIN)
+    const re = new Float32Array(WIN)
+    const im = new Float32Array(WIN)
+    const bins = WIN / 2
+    const binHz = srA / WIN
+    // Log-spaced band edges from 40 Hz to Nyquist.
+    const BANDS = 24
+    const bandOfBin = new Int8Array(bins).fill(-1)
+    const fMin = 40
+    const fMax = srA / 2
+    for (let k = 1; k < bins; k++) {
+      const freq = k * binHz
+      if (freq < fMin) {
+        bandOfBin[k] = 0
+        continue
+      }
+      const b = Math.floor((Math.log(freq / fMin) / Math.log(fMax / fMin)) * BANDS)
+      bandOfBin[k] = Math.min(b, BANDS - 1)
+    }
+    const lowBandMax = Math.floor((Math.log(200 / fMin) / Math.log(fMax / fMin)) * BANDS)
+    const bandMag = new Float32Array(BANDS)
+    const prevLog = new Float32Array(BANDS)
+    for (let f = 0; f < frames; f++) {
+      const base = f * HOP
+      for (let i = 0; i < WIN; i++) re[i] = mono[base + i] * hann[i]
+      im.fill(0)
+      fft(re, im)
+      bandMag.fill(0)
+      for (let k = 1; k < bins; k++) {
+        bandMag[bandOfBin[k]] += Math.sqrt(re[k] * re[k] + im[k] * im[k])
+      }
+      let s = 0
+      let sLow = 0
+      let eLow = 0
+      for (let b = 0; b < BANDS; b++) {
+        const L = Math.log1p(bandMag[b])
+        const d = L - prevLog[b]
+        if (d > 0) {
+          s += d
+          if (b <= lowBandMax) sLow += d
+        }
+        if (b <= lowBandMax) eLow += bandMag[b]
+        prevLog[b] = L
+      }
+      flux[f] = s
+      lowFlux[f] = sLow
+      lowEnergy[f] = eLow
+    }
+  }
+
+  // ---- 3. adaptive post-processing ----
+  subtractLocalMean(flux, 16)
+  subtractLocalMean(lowFlux, 16)
+  normalizeStd(flux)
+  normalizeStd(lowFlux)
+  // The tracking envelope leans on the low band: beats anchor on the
+  // kick/bass, not on offbeat hats.
+  const combined = new Float32Array(frames)
+  for (let i = 0; i < frames; i++) combined[i] = flux[i] + 1.5 * lowFlux[i]
+  normalizeStd(combined)
+  const env = gaussianSmooth(combined, 2)
+  const lowEnv = gaussianSmooth(lowFlux, 2)
+  // Linear (not log) low-band energy for downbeat scoring: a sub layered
+  // on a kick barely moves the log-compressed flux, but it clearly moves
+  // the raw energy.
+  zScore(lowEnergy)
+  const lowEnergyEnv = gaussianSmooth(lowEnergy, 2)
+
+  // ---- 4. tempo candidates ----
   const minLag = Math.floor((envRate * 60) / MAX_BPM)
   const maxLag = Math.ceil((envRate * 60) / MIN_BPM)
   const acf = new Float32Array(maxLag * 3 + 2)
   for (let lag = minLag; lag < acf.length; lag++) {
-    let s = 0
     const n = frames - lag
     if (n < 64) break
-    for (let i = 0; i < n; i++) s += onset[i] * onset[i + lag]
+    let s = 0
+    for (let i = 0; i < n; i++) s += env[i] * env[i + lag]
     acf[lag] = s / n
   }
   const acfAt = (lag: number) => {
     const i = Math.round(lag)
     return i >= 0 && i < acf.length ? acf[i] : 0
   }
-  // Harmonic score with a gentle log-Gaussian tempo prior. A purely
-  // periodic kick scores identically at the beat lag and its multiples,
-  // so without the prior, downbeat emphasis tips the scale toward
-  // half-tempo (octave errors). The prior breaks those ties toward the
-  // typical DJ range without overriding a clear slow/fast groove.
-  const scoreAt = (lag: number) => {
-    const bpm = (60 * envRate) / lag
-    const prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 128) / 0.55, 2))
-    return (acfAt(lag) + acfAt(lag * 2) / 2 + acfAt(lag * 3) / 3) * (0.6 + 0.4 * prior)
-  }
-  let bestLag = 0
-  let bestScore = -1
-  for (let lag = minLag; lag <= maxLag; lag++) {
-    const score = scoreAt(lag)
-    if (score > bestScore) {
-      bestScore = score
-      bestLag = lag
-    }
-  }
-  if (bestLag === 0 || bestScore <= 0) return null
-  // Parabolic interpolation around the integer peak.
-  const s0 = scoreAt(bestLag - 1)
-  const s1 = bestScore
-  const s2 = scoreAt(bestLag + 1)
-  const denom = s0 - 2 * s1 + s2
-  const lagRefined = denom !== 0 ? bestLag + (0.5 * (s0 - s2)) / denom : bestLag
-  const bpm0 = (60 * envRate) / lagRefined
+  const prior = (bpm: number) => Math.exp(-0.5 * Math.pow(Math.log2(bpm / 128) / 0.7, 2))
+  const scoreAt = (lag: number) =>
+    (acfAt(lag) + acfAt(lag * 2) / 2 + acfAt(lag * 3) / 3) *
+    (0.6 + 0.4 * prior((60 * envRate) / lag))
 
-  // ---- 4. joint fine search of BPM and beat phase ----
-  const comb = (beatFrames: number, phase: number): number => {
+  const peaks: { lag: number; score: number }[] = []
+  for (let lag = minLag + 1; lag < maxLag; lag++) {
+    const s = scoreAt(lag)
+    if (s > scoreAt(lag - 1) && s >= scoreAt(lag + 1)) peaks.push({ lag, score: s })
+  }
+  peaks.sort((a, b) => b.score - a.score)
+
+  const candidates: number[] = []
+  const addCandidate = (bpm: number) => {
+    if (bpm < MIN_BPM || bpm > MAX_BPM) return
+    if (candidates.some((c) => Math.abs(c - bpm) / bpm < 0.04)) return
+    candidates.push(bpm)
+  }
+  for (const p of peaks.slice(0, 5)) addCandidate((60 * envRate) / p.lag)
+  // Octave and shuffle relatives of the strongest peaks — the usual
+  // failure modes are half/double tempo and 2:3 confusion.
+  for (const p of peaks.slice(0, 3)) {
+    const bpm = (60 * envRate) / p.lag
+    addCandidate(bpm * 2)
+    addCandidate(bpm / 2)
+    addCandidate(bpm * 1.5)
+    addCandidate((bpm * 2) / 3)
+  }
+  if (candidates.length === 0) return null
+
+  // ---- 5 + 6. verify each candidate by beat tracking + regression ----
+  interface Fit {
+    bpm: number
+    anchorFrame: number
+    beatFrames: number
+    score: number
+  }
+  let best: Fit | null = null
+  for (const bpm0 of candidates) {
+    const tau = (envRate * 60) / bpm0
+    const beats = trackBeats(env, tau)
+    if (beats.length < 16) continue
+    const fit = fitLine(beats)
+    if (!fit) continue
+    const bpm = (60 * envRate) / fit.slope
+    if (bpm < 50 || bpm > 210) continue
+    // Contrast: how strongly do onsets land on the fitted grid?
+    // (env is zero-mean after local-mean removal, so random positions
+    // score ~0 and locked grids score high.)
     let s = 0
     let k = 0
-    for (let p = phase; p < frames; p += beatFrames, k++) {
-      s += onset[Math.round(p)]
+    for (let p = fit.intercept; p < frames - 1 && p >= 0; p += fit.slope, k++) {
+      s += interp(env, p)
     }
-    return k > 0 ? s / k : 0
-  }
-  let bestBpm = bpm0
-  let bestPhase = 0
-  let best = -1
-  for (let c = -80; c <= 80; c++) {
-    const bpm = bpm0 * (1 + c * 0.00025) // ±2% in 0.025% steps
-    const bf = (envRate * 60) / bpm
-    for (let p = 0; p < bf; p += bf / 24) {
-      const s = comb(bf, p)
-      if (s > best) {
-        best = s
-        bestBpm = bpm
-        bestPhase = p
-      }
+    if (k < 16) continue
+    const contrast = (s / k) * fit.keptRatio * (0.6 + 0.4 * prior(bpm))
+    if (!best || contrast > best.score) {
+      best = { bpm, anchorFrame: fit.intercept, beatFrames: fit.slope, score: contrast }
     }
   }
-  // Final phase polish at fine resolution.
-  {
-    const bf = (envRate * 60) / bestBpm
-    let bestP = bestPhase
-    let bestS = -1
-    for (let p = bestPhase - bf / 24; p <= bestPhase + bf / 24; p += bf / 256) {
-      const s = comb(bf, Math.max(0, p))
-      if (s > bestS) {
-        bestS = s
-        bestP = Math.max(0, p)
-      }
-    }
-    bestPhase = bestP
-  }
+  if (!best || best.score <= 0) return null
 
-  // ---- 5. downbeat among the four beat candidates ----
-  const beatFrames = (envRate * 60) / bestBpm
+  // ---- 7. downbeat among the four rotations ----
   let bestBarOffset = 0
-  let bestBarScore = -1
+  let bestBarScore = -Infinity
   for (let c = 0; c < BEATS_PER_BAR; c++) {
     let s = 0
     let k = 0
-    for (let p = bestPhase + c * beatFrames; p < frames; p += beatFrames * BEATS_PER_BAR, k++) {
-      s += lowOnset[Math.round(p)] + 0.25 * onset[Math.round(p)]
+    for (
+      let p = best.anchorFrame + c * best.beatFrames;
+      p < frames - 5 && p >= 0;
+      p += best.beatFrames * BEATS_PER_BAR, k++
+    ) {
+      // Energy sampled slightly after the beat (a sub-bass swells over
+      // the first ~50ms); flux sampled on it.
+      s += interp(lowEnergyEnv, p + 4) + 0.5 * interp(lowEnv, p) + 0.25 * interp(env, p)
     }
-    const score = k > 0 ? s / k : 0
+    const score = k > 0 ? s / k : -Infinity
     if (score > bestBarScore) {
       bestBarScore = score
       bestBarOffset = c
     }
   }
 
-  // ---- anchors in track seconds, reduced into one period ----
-  const beatLen = 60 / bestBpm
+  // ---- anchors in track seconds ----
+  // Spectral flux localizes a transient near the center of the frame
+  // window (the WIN/2 term), but the flux peaks while the transient is
+  // still entering the window — about one hop early (measured ~10ms,
+  // calibrated against ground-truth material).
+  const ONSET_LEAD = 0.01
+  const toSeconds = (frame: number) =>
+    start / buffer.sampleRate + (frame * HOP + WIN / 2) / srA + ONSET_LEAD
+  const beatLen = 60 / best.bpm
   const barLen = beatLen * BEATS_PER_BAR
-  const windowStartSec = start / sr
-  const firstBeatRaw = windowStartSec + (bestPhase * HOP) / sr
-  const firstBarRaw = windowStartSec + ((bestPhase + bestBarOffset * beatFrames) * HOP) / sr
+  const firstBeatRaw = toSeconds(best.anchorFrame)
+  const firstBarRaw = toSeconds(best.anchorFrame + bestBarOffset * best.beatFrames)
 
   return {
-    bpm: Math.round(bestBpm * 100) / 100,
+    bpm: Math.round(best.bpm * 100) / 100,
     firstBeat: positiveMod(firstBeatRaw, beatLen),
     firstBar: positiveMod(firstBarRaw, barLen),
     beatsPerBar: BEATS_PER_BAR,
   }
+}
+
+/**
+ * Ellis-style dynamic-programming beat tracker: each frame's cumulative
+ * score is its onset strength plus the best predecessor a beat-ish ago,
+ * penalized for deviating from the target period. Backtracking the best
+ * end state yields the beat sequence.
+ */
+function trackBeats(env: Float32Array, tau: number): number[] {
+  const n = env.length
+  const C = new Float32Array(n)
+  const P = new Int32Array(n).fill(-1)
+  const lo = Math.max(1, Math.round(tau / 2))
+  const hi = Math.round(tau * 2)
+  const tightness = 100
+  for (let t = 0; t < n; t++) {
+    let bestV = 0
+    let bestI = -1
+    const from = Math.max(0, t - hi)
+    const to = t - lo
+    for (let t2 = from; t2 <= to; t2++) {
+      const logr = Math.log((t - t2) / tau)
+      const v = C[t2] - tightness * logr * logr
+      if (v > bestV) {
+        bestV = v
+        bestI = t2
+      }
+    }
+    C[t] = env[t] + (bestI >= 0 ? bestV : 0)
+    P[t] = bestI
+  }
+  let t = n - 1
+  let bestC = -Infinity
+  for (let i = Math.max(0, n - Math.round(tau * 1.5)); i < n; i++) {
+    if (C[i] > bestC) {
+      bestC = C[i]
+      t = i
+    }
+  }
+  const beats: number[] = []
+  while (t >= 0) {
+    beats.push(t)
+    t = P[t]
+  }
+  beats.reverse()
+  return beats
+}
+
+/**
+ * Least-squares line through (index, beatFrame) with one pass of outlier
+ * rejection — averaging every tracked beat pins the tempo far tighter
+ * than any local measurement.
+ */
+function fitLine(
+  beats: number[]
+): { slope: number; intercept: number; keptRatio: number } | null {
+  const points = beats.map((t, i) => ({ x: i, y: t }))
+  const solve = (pts: { x: number; y: number }[]) => {
+    const n = pts.length
+    let sx = 0
+    let sy = 0
+    let sxx = 0
+    let sxy = 0
+    for (const p of pts) {
+      sx += p.x
+      sy += p.y
+      sxx += p.x * p.x
+      sxy += p.x * p.y
+    }
+    const denom = n * sxx - sx * sx
+    if (denom === 0) return null
+    const slope = (n * sxy - sx * sy) / denom
+    const intercept = (sy - slope * sx) / n
+    return { slope, intercept }
+  }
+  const fit = solve(points)
+  if (!fit || fit.slope <= 0) return null
+  const residuals = points.map((p) => p.y - (fit!.intercept + fit!.slope * p.x))
+  const sigma = Math.sqrt(residuals.reduce((a, r) => a + r * r, 0) / residuals.length)
+  if (sigma > 0) {
+    const kept = points.filter((p, i) => Math.abs(residuals[i]) <= 2.5 * sigma)
+    if (kept.length >= 8 && kept.length < points.length) {
+      const refit = solve(kept)
+      if (refit && refit.slope > 0) {
+        const keptRatio = kept.length / points.length
+        return { ...refit, keptRatio }
+      }
+    }
+  }
+  return { ...fit, keptRatio: 1 }
 }
 
 /** Start index (in samples) of the loudest stretch of `length` samples. */
@@ -234,10 +385,65 @@ function loudestWindowStart(buffer: AudioBuffer, length: number): number {
   return bestStart * block
 }
 
-function onePole(freq: number, sr: number): number {
-  return Math.exp((-2 * Math.PI * freq) / sr)
+// ---- small DSP helpers ----
+
+function subtractLocalMean(x: Float32Array, half: number) {
+  const n = x.length
+  const prefix = new Float64Array(n + 1)
+  for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i] + x[i]
+  for (let i = 0; i < n; i++) {
+    const a = Math.max(0, i - half)
+    const b = Math.min(n, i + half + 1)
+    const mean = (prefix[b] - prefix[a]) / (b - a)
+    x[i] = Math.max(0, x[i] - mean)
+  }
 }
 
-function positiveMod(v: number, m: number): number {
-  return ((v % m) + m) % m
+function normalizeStd(x: Float32Array) {
+  let sum = 0
+  for (let i = 0; i < x.length; i++) sum += x[i] * x[i]
+  const std = Math.sqrt(sum / x.length)
+  if (std > 0) for (let i = 0; i < x.length; i++) x[i] /= std
 }
+
+function zScore(x: Float32Array) {
+  let mean = 0
+  for (let i = 0; i < x.length; i++) mean += x[i]
+  mean /= x.length
+  let varSum = 0
+  for (let i = 0; i < x.length; i++) {
+    x[i] -= mean
+    varSum += x[i] * x[i]
+  }
+  const std = Math.sqrt(varSum / x.length)
+  if (std > 0) for (let i = 0; i < x.length; i++) x[i] /= std
+}
+
+function gaussianSmooth(x: Float32Array, sigma: number): Float32Array {
+  const radius = Math.ceil(sigma * 3)
+  const kernel = new Float32Array(radius * 2 + 1)
+  let ksum = 0
+  for (let i = -radius; i <= radius; i++) {
+    kernel[i + radius] = Math.exp(-0.5 * (i / sigma) * (i / sigma))
+    ksum += kernel[i + radius]
+  }
+  for (let i = 0; i < kernel.length; i++) kernel[i] /= ksum
+  const out = new Float32Array(x.length)
+  for (let i = 0; i < x.length; i++) {
+    let s = 0
+    for (let j = -radius; j <= radius; j++) {
+      const idx = i + j
+      if (idx >= 0 && idx < x.length) s += x[idx] * kernel[j + radius]
+    }
+    out[i] = s
+  }
+  return out
+}
+
+function interp(x: Float32Array, pos: number): number {
+  const i = Math.floor(pos)
+  if (i < 0 || i >= x.length - 1) return 0
+  const frac = pos - i
+  return x[i] + (x[i + 1] - x[i]) * frac
+}
+

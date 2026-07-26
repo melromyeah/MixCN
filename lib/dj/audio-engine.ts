@@ -3,12 +3,15 @@ import type { DeckId } from "./types"
 import { getVinylWorkletUrl } from "./vinyl-worklet"
 
 /**
- * Top-level audio graph: two decks -> master gain -> analyser -> speakers,
- * with a parallel MediaStream tap for recording the mix.
+ * Top-level audio graph: two decks -> master gain -> limiter -> speakers,
+ * with parallel taps (all post-limiter, so meters show what you hear)
+ * for recording, the stereo VU pair, and the console glow.
  */
 export class AudioEngine {
   readonly ctx: AudioContext
   readonly master: GainNode
+  /** Brickwall-ish safety limiter so hot mixes don't clip the output. */
+  readonly limiter: DynamicsCompressorNode
   readonly masterAnalyser: AnalyserNode
   readonly masterAnalyserL: AnalyserNode
   readonly masterAnalyserR: AnalyserNode
@@ -21,17 +24,43 @@ export class AudioEngine {
   private chunks: Blob[] = []
   recordingStartedAt: number | null = null
 
+  /** Current crossfader position (engine-owned so automation moves the UI). */
+  crossfade = 0
+  version = 0
+  private listeners = new Set<() => void>()
+
+  subscribe = (listener: () => void) => {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  private emit() {
+    this.version++
+    for (const listener of this.listeners) listener()
+  }
+
   constructor() {
     this.ctx = new AudioContext({ latencyHint: "interactive" })
     this.master = this.ctx.createGain()
     this.master.gain.value = 0.9
+
+    // Safety limiter: hard-knee, high-ratio compression that only bites
+    // when both decks stack up near full scale.
+    this.limiter = this.ctx.createDynamicsCompressor()
+    this.limiter.threshold.value = -1.5
+    this.limiter.knee.value = 0
+    this.limiter.ratio.value = 20
+    this.limiter.attack.value = 0.002
+    this.limiter.release.value = 0.25
+    this.master.connect(this.limiter)
+
     this.masterAnalyser = this.ctx.createAnalyser()
     this.masterAnalyser.fftSize = 1024
     this.recordDest = this.ctx.createMediaStreamDestination()
 
-    this.master.connect(this.masterAnalyser)
+    this.limiter.connect(this.masterAnalyser)
     this.masterAnalyser.connect(this.ctx.destination)
-    this.master.connect(this.recordDest)
+    this.limiter.connect(this.recordDest)
 
     // Per-channel taps for the stereo master VU pair.
     this.masterAnalyserL = this.ctx.createAnalyser()
@@ -39,7 +68,7 @@ export class AudioEngine {
     this.masterAnalyserR = this.ctx.createAnalyser()
     this.masterAnalyserR.fftSize = 1024
     const splitter = this.ctx.createChannelSplitter(2)
-    this.master.connect(splitter)
+    this.limiter.connect(splitter)
     splitter.connect(this.masterAnalyserL, 0)
     splitter.connect(this.masterAnalyserR, 1)
 
@@ -52,7 +81,7 @@ export class AudioEngine {
     glowFilter.Q.value = 0.7
     this.glowAnalyser = this.ctx.createAnalyser()
     this.glowAnalyser.fftSize = 512
-    this.master.connect(glowFilter)
+    this.limiter.connect(glowFilter)
     glowFilter.connect(this.glowAnalyser)
 
     const workletReady = this.ctx.audioWorklet.addModule(getVinylWorkletUrl())
@@ -67,11 +96,19 @@ export class AudioEngine {
     if (this.ctx.state === "suspended") await this.ctx.resume()
   }
 
-  /** value in -1 (full A) .. 1 (full B), equal-power curve. */
+  /**
+   * value in -1 (full A) .. 1 (full B). Plateau curve: each deck plays at
+   * full volume across its own half; only past the middle does it fade,
+   * reaching silence at the opposite end. The fade half follows a cosine
+   * for a smooth roll-off.
+   */
   setCrossfade(value: number) {
-    const t = (value + 1) / 2
-    this.decks.A.setCrossfadeGain(Math.cos((t * Math.PI) / 2))
-    this.decks.B.setCrossfadeGain(Math.sin((t * Math.PI) / 2))
+    this.crossfade = Math.min(1, Math.max(-1, value))
+    const fadeA = Math.max(0, this.crossfade) // A fades only on B's half
+    const fadeB = Math.max(0, -this.crossfade) // B fades only on A's half
+    this.decks.A.setCrossfadeGain(Math.cos((fadeA * Math.PI) / 2))
+    this.decks.B.setCrossfadeGain(Math.cos((fadeB * Math.PI) / 2))
+    this.emit()
   }
 
   setMasterVolume(volume: number) {

@@ -13,6 +13,14 @@ export interface BeatGrid {
   beatsPerBar: number
 }
 
+/** Detected musical key with its Camelot-wheel position. */
+export interface KeyInfo {
+  /** e.g. "Am", "F♯" */
+  name: string
+  /** e.g. "8A" (minor) / "8B" (major) */
+  camelot: string
+}
+
 export interface Track {
   id: string
   title: string
@@ -20,8 +28,27 @@ export interface Track {
   duration: number
   bpm: number | null
   grid: BeatGrid | null
+  key: KeyInfo | null
+  /** Auto-gain multiplier that normalizes perceived loudness (1 = none). */
+  gain: number
   buffer: AudioBuffer
   peaks: Float32Array
+}
+
+/** What the library persists in IndexedDB (no decoded audio). */
+export interface StoredTrack {
+  id: string
+  title: string
+  artist: string
+  duration: number
+  bpm: number | null
+  grid: BeatGrid | null
+  key: KeyInfo | null
+  gain: number
+  peaks: ArrayBuffer
+  /** Original (encoded) file bytes; decoded on demand. */
+  bytes: ArrayBuffer
+  addedAt: number
 }
 
 export interface LoopRegion {
