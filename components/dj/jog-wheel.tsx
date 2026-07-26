@@ -12,7 +12,7 @@ interface JogWheelProps {
   className?: string
 }
 
-// Vinyl at 33 1/3 RPM: one revolution every 1.8 seconds.
+// Vinyl at 33 1/3 RPM: one revolution every 1.5 seconds.
 const SECONDS_PER_REV = 1.5
 // Degrees per millisecond when spinning at normal speed.
 const DEG_PER_MS_AT_1X = 360 / (SECONDS_PER_REV * 1000)
@@ -24,6 +24,7 @@ const DEG_PER_MS_AT_1X = 360 / (SECONDS_PER_REV * 1000)
  * scratching, whether the deck is playing or paused.
  */
 export function JogWheel({ deck, size = "fill", className }: JogWheelProps) {
+  const rootRef = React.useRef<HTMLDivElement>(null)
   const discRef = React.useRef<HTMLDivElement>(null)
   const scratch = React.useRef<{
     lastAngle: number
@@ -31,6 +32,24 @@ export function JogWheel({ deck, size = "fill", className }: JogWheelProps) {
     velocity: number
     raf: number
   } | null>(null)
+
+  // "fill": size to the largest square that fits the parent. Pure CSS
+  // (aspect-square + h-full + max-w-full) turns into an ellipse when the
+  // parent is wider than tall or vice versa, so measure instead.
+  React.useEffect(() => {
+    if (size !== "fill") return
+    const el = rootRef.current
+    const parent = el?.parentElement
+    if (!el || !parent) return
+    const ro = new ResizeObserver(() => {
+      const r = parent.getBoundingClientRect()
+      const s = Math.max(48, Math.floor(Math.min(r.width, r.height)))
+      el.style.width = `${s}px`
+      el.style.height = `${s}px`
+    })
+    ro.observe(parent)
+    return () => ro.disconnect()
+  }, [size])
 
   React.useEffect(() => {
     let raf = 0
@@ -120,10 +139,10 @@ export function JogWheel({ deck, size = "fill", className }: JogWheelProps) {
 
   return (
     <div
+      ref={rootRef}
       className={cn(
-        "relative touch-none select-none rounded-full border bg-card shadow-sm",
+        "relative shrink-0 touch-none select-none rounded-full border bg-card shadow-sm",
         deck.track ? "cursor-grab active:cursor-grabbing" : "opacity-60",
-        size === "fill" && "aspect-square h-full max-h-full max-w-full",
         className
       )}
       style={size === "fill" ? undefined : { width: size, height: size }}

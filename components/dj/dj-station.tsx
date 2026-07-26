@@ -1,16 +1,26 @@
 "use client"
 
 import * as React from "react"
-import { Circle, Disc3, Square } from "lucide-react"
+import { Circle, Disc3, Radio, Square } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Toaster } from "@/components/ui/sonner"
 import { Deck } from "@/components/dj/deck"
 import { Mixer } from "@/components/dj/mixer"
 import { TrackLibrary } from "@/components/dj/track-library"
 import { getEngine, type AudioEngine } from "@/lib/dj/audio-engine"
+import { AutoDj } from "@/lib/dj/auto-dj"
+import { computeAutoGain } from "@/lib/dj/autogain"
 import { analyzeBeatGrid } from "@/lib/dj/beatgrid"
+import { detectKey } from "@/lib/dj/key"
 import { useRaf } from "@/hooks/use-deck-state"
 
 export function DjStation() {
@@ -21,14 +31,28 @@ export function DjStation() {
     () => null
   )
 
+  const autoDj = React.useMemo(() => (engine ? new AutoDj(engine) : null), [engine])
+
+  // Auto-DJ narrates what it's doing via toasts.
+  React.useEffect(() => {
+    if (!autoDj) return
+    autoDj.onEvent = (message, description) => toast(message, { description })
+    return () => {
+      autoDj.onEvent = null
+    }
+  }, [autoDj])
+
   // Expose the engine and analyzer in dev for debugging from the console.
   React.useEffect(() => {
     if (engine && process.env.NODE_ENV !== "production") {
       const w = window as unknown as Record<string, unknown>
       w.__engine = engine
       w.__analyzeBeatGrid = analyzeBeatGrid
+      w.__detectKey = detectKey
+      w.__computeAutoGain = computeAutoGain
+      w.__autoDj = autoDj
     }
-  }, [engine])
+  }, [engine, autoDj])
 
   const rootRef = React.useRef<HTMLDivElement>(null)
 
@@ -76,7 +100,7 @@ export function DjStation() {
   return (
     <div
       ref={rootRef}
-      className="console-glow flex min-h-svh w-full flex-col bg-background lg:[@media(min-height:620px)]:h-svh lg:[@media(min-height:620px)]:overflow-hidden"
+      className="console-glow flex min-h-svh w-full flex-col bg-background lg:[@media(min-height:860px)]:h-svh lg:[@media(min-height:860px)]:overflow-hidden"
     >
       <header className="flex shrink-0 items-center justify-between border-b px-4 py-2">
         <div className="flex items-center gap-2.5">
@@ -87,7 +111,10 @@ export function DjStation() {
             </p>
           </div>
         </div>
-        <RecordButton engine={engine} />
+        <div className="flex items-center gap-2">
+          {autoDj && <AutoDjControls autoDj={autoDj} />}
+          <RecordButton engine={engine} />
+        </div>
       </header>
 
       <main className="grid min-h-0 flex-1 gap-3 p-3 lg:grid-cols-[minmax(0,1fr)_clamp(220px,19vw,300px)_minmax(0,1fr)]">
@@ -96,11 +123,58 @@ export function DjStation() {
         <Deck deckId="B" deck={engine.decks.B} otherDeck={engine.decks.A} className="min-h-0" />
       </main>
 
-      <div className="shrink-0 px-3 pb-3 lg:h-[clamp(240px,34vh,460px)]">
-        <TrackLibrary engine={engine} className="h-full" />
+      <div className="shrink-0 px-3 pb-3 lg:h-[clamp(220px,28vh,420px)]">
+        <TrackLibrary engine={engine} autoDj={autoDj} className="h-full" />
       </div>
 
       <Toaster position="bottom-right" />
+    </div>
+  )
+}
+
+/** Auto-DJ toggle plus the transition length in bars. */
+function AutoDjControls({ autoDj }: { autoDj: AutoDj }) {
+  React.useSyncExternalStore(
+    autoDj.subscribe,
+    () => autoDj.version,
+    () => 0
+  )
+  const [bars, setBars] = React.useState(String(autoDj.bars))
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <Select
+        value={bars}
+        onValueChange={(v) => {
+          const next = String(v)
+          setBars(next)
+          autoDj.bars = parseInt(next, 10)
+        }}
+      >
+        <SelectTrigger
+          size="sm"
+          className="w-14 font-mono"
+          aria-label="Auto-DJ transition length in bars"
+          title="Auto-DJ transition length (bars)"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {["4", "8", "16"].map((b) => (
+            <SelectItem key={b} value={b}>
+              {b}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <Button
+        variant={autoDj.active ? "default" : "outline"}
+        size="sm"
+        onClick={() => (autoDj.active ? autoDj.stop() : void autoDj.start())}
+        title="Auto-DJ: automatically sync, bar-align and crossfade through the library"
+      >
+        <Radio className={autoDj.active ? "animate-pulse" : undefined} /> Auto-DJ
+      </Button>
     </div>
   )
 }
